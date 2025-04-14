@@ -6,10 +6,12 @@
 
 import asyncio
 import itertools
+import struct
 import sys
 import time
 from typing import AsyncGenerator, List
 
+import numpy as np
 from loguru import logger
 from PIL import Image
 
@@ -249,11 +251,49 @@ class BaseOutputTransport(FrameProcessor):
             self._sink_clock_queue = asyncio.PriorityQueue()
             self._sink_clock_task = self.create_task(self._sink_clock_task_handler())
 
+    def _get_faded_out_queued_audio(self, fade_duration_ms: int = 700):
+        """Fade out audio frames currently in the sink queue."""
+        if not self._params.audio_out_enabled:
+            return
+
+        try:
+            # Collect audio frames from queue
+            audio_frames = []
+
+            num_frames_to_process = fade_duration_ms // 10 // self._params.audio_out_10ms_chunks
+            while (not self._sink_queue.empty()) and len(audio_frames) <= num_frames_to_process:
+                frame = self._sink_queue.get_nowait()
+                if isinstance(frame, OutputAudioRawFrame):
+                    audio_frames.append(frame)
+
+            if not audio_frames:
+                return
+
+            logger.debug(f"Fading out {len(audio_frames)} audio frames from the sink queue ")
+            # Combine all audio frames
+            combined_audio = b"".join(frame.audio for frame in audio_frames)
+            samples = np.frombuffer(combined_audio, dtype=np.int16)
+
+            num_samples = len(samples)
+            fade_curve = np.cos(np.linspace(0, np.pi / 2, num_samples, dtype=np.float32))
+
+            samples = (samples * fade_curve).astype(np.int16)
+            faded_audio = struct.pack(f"{len(samples)}h", *samples)
+            return faded_audio
+
+        except asyncio.QueueEmpty:
+            print("Queue is empty, nothing to fade out")
+            pass
+
     async def _cancel_sink_tasks(self):
         # Stop sink tasks.
+        faded_audio = self._get_faded_out_queued_audio()
+
         if self._sink_task:
             await self.cancel_task(self._sink_task)
             self._sink_task = None
+            if faded_audio:
+                await self.write_raw_audio_frames(faded_audio)
         # Stop sink clock tasks.
         if self._sink_clock_task:
             await self.cancel_task(self._sink_clock_task)
