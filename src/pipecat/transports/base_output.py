@@ -255,46 +255,44 @@ class BaseOutputTransport(FrameProcessor):
             # Collect audio frames from queue
             audio_frames: List[OutputAudioRawFrame] = []
 
+            # Calculate the number of frames to process based on the fade duration
+            # and the audio chunk size.
             num_frames_to_process = fade_duration_ms // 10 // self._params.audio_out_10ms_chunks
             while not self._sink_queue.empty():
                 frame = self._sink_queue.get_nowait()
                 if isinstance(frame, OutputAudioRawFrame):
+                    # Push only required frames to the audio queue to fade out
                     if len(audio_frames) <= num_frames_to_process:
                         audio_frames.append(frame)
+                    # Mark remaining frames as done
                     else:
                         self._sink_queue.task_done()
 
+            # Return if we don't have any audio frames to process
             if not audio_frames:
                 return
 
             logger.debug(f"Fading out {len(audio_frames)} audio frames from the sink queue ")
+            # Combine all audio frames
+            combined_audio = b"".join(frame.audio for frame in audio_frames)
+            # Convert the joined frames to a mutable numpy array
+            samples = np.frombuffer(combined_audio, dtype=np.int16)
 
-            total_samples = sum(
-                len(frame.audio) // 2 for frame in audio_frames
-            )  # divide by 2 for int16
-            # using cosine fade to fade out the sound from 1.0 to 0.0
-            fade_curve = np.cos(np.linspace(0, np.pi / 2, total_samples, dtype=np.float32))
+            # Apply a smooth fade-out effect to the sample
+            fade_curve = np.cos(np.linspace(0, np.pi / 2, len(samples), dtype=np.float32))
+            samples = (samples * fade_curve).astype(np.int16)
 
-            sample_offset = 0
-            for frame in audio_frames:
-                samples = np.frombuffer(frame.audio, dtype=np.int16)
-                num_samples = len(samples)
-
-                # Get the segment of fade curve for this frame
-                frame_fade = fade_curve[sample_offset : sample_offset + num_samples]
-                # Apply fade to samples
-                samples = (samples * frame_fade).astype(np.int16)
-                chunk = OutputAudioRawFrame(
-                    struct.pack(f"{len(samples)}h", *samples),
-                    sample_rate=frame.sample_rate,
-                    num_channels=frame.num_channels,
-                )
-
-                await self._sink_queue.put(chunk)
-                sample_offset += num_samples
+            # Create a new OutputAudioRawFrame with the faded audio
+            # and use _handle_audio to send it to the sink queue
+            # as this will also handle the resampling and chunking
+            frame = OutputAudioRawFrame(
+                audio=samples.tobytes(),
+                sample_rate=self._sample_rate,
+                num_channels=self._params.audio_out_channels,
+            )
+            await self._handle_audio(frame)
 
         except asyncio.QueueEmpty:
-            print("Queue is empty, nothing to fade out")
             pass
 
     async def _cancel_sink_tasks(self):
