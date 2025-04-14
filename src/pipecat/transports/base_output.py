@@ -264,7 +264,7 @@ class BaseOutputTransport(FrameProcessor):
         elif not self._params.audio_out_fade_enabled:
             return
         elif self._params.audio_out_fade_duration <= 0:
-            self._reset_tasks()
+            await self._reset_tasks()
             return
 
         try:
