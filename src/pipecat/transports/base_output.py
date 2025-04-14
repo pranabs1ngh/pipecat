@@ -178,12 +178,23 @@ class BaseOutputTransport(FrameProcessor):
         else:
             await self._sink_queue.put(frame)
 
+    async def _reset_tasks(self):
+        # Cancel sink and camera tasks.
+        await self._cancel_sink_tasks()
+        await self._cancel_camera_task()
+        # Create sink and camera tasks.
+        self._create_camera_task()
+        self._create_sink_tasks()
+
     async def _handle_interruptions(self, frame: Frame):
         if not self.interruptions_allowed:
             return
 
         if isinstance(frame, StartInterruptionFrame):
-            await self._fade_out_queued_audio()
+            if self._params.audio_out_fade_enabled:
+                await self._fade_out_queued_audio()
+            else:
+                await self._reset_tasks()
             # Let's send a bot stopped speaking if we have to.
             await self._bot_stopped_speaking()
 
@@ -246,9 +257,14 @@ class BaseOutputTransport(FrameProcessor):
             self._sink_clock_queue = asyncio.PriorityQueue()
             self._sink_clock_task = self.create_task(self._sink_clock_task_handler())
 
-    async def _fade_out_queued_audio(self, fade_duration_ms: int = 700):
+    async def _fade_out_queued_audio(self):
         """Fade out audio frames currently in the sink queue."""
         if not self._params.audio_out_enabled:
+            return
+        elif not self._params.audio_out_fade_enabled:
+            return
+        elif self._params.audio_out_fade_duration <= 0:
+            self._reset_tasks()
             return
 
         try:
@@ -257,6 +273,7 @@ class BaseOutputTransport(FrameProcessor):
 
             # Calculate the number of frames to process based on the fade duration
             # and the audio chunk size.
+            fade_duration_ms = self._params.audio_out_fade_duration
             num_frames_to_process = fade_duration_ms // 10 // self._params.audio_out_10ms_chunks
             while not self._sink_queue.empty():
                 frame = self._sink_queue.get_nowait()
@@ -264,9 +281,8 @@ class BaseOutputTransport(FrameProcessor):
                     # Push only required frames to the audio queue to fade out
                     if len(audio_frames) <= num_frames_to_process:
                         audio_frames.append(frame)
-                    # Mark remaining frames as done
-                    else:
-                        self._sink_queue.task_done()
+                    # Mark all frames as processed
+                    self._sink_queue.task_done()
 
             # Return if we don't have any audio frames to process
             if not audio_frames:
