@@ -183,12 +183,7 @@ class BaseOutputTransport(FrameProcessor):
             return
 
         if isinstance(frame, StartInterruptionFrame):
-            # Cancel sink and camera tasks.
-            await self._cancel_sink_tasks()
-            await self._cancel_camera_task()
-            # Create sink and camera tasks.
-            self._create_camera_task()
-            self._create_sink_tasks()
+            await self._fade_out_queued_audio()
             # Let's send a bot stopped speaking if we have to.
             await self._bot_stopped_speaking()
 
@@ -251,49 +246,61 @@ class BaseOutputTransport(FrameProcessor):
             self._sink_clock_queue = asyncio.PriorityQueue()
             self._sink_clock_task = self.create_task(self._sink_clock_task_handler())
 
-    def _get_faded_out_queued_audio(self, fade_duration_ms: int = 700):
+    async def _fade_out_queued_audio(self, fade_duration_ms: int = 700):
         """Fade out audio frames currently in the sink queue."""
         if not self._params.audio_out_enabled:
             return
 
         try:
             # Collect audio frames from queue
-            audio_frames = []
+            audio_frames: List[OutputAudioRawFrame] = []
 
             num_frames_to_process = fade_duration_ms // 10 // self._params.audio_out_10ms_chunks
-            while (not self._sink_queue.empty()) and len(audio_frames) <= num_frames_to_process:
+            while not self._sink_queue.empty():
                 frame = self._sink_queue.get_nowait()
                 if isinstance(frame, OutputAudioRawFrame):
-                    audio_frames.append(frame)
+                    if len(audio_frames) <= num_frames_to_process:
+                        audio_frames.append(frame)
+                    else:
+                        self._sink_queue.task_done()
 
             if not audio_frames:
                 return
 
             logger.debug(f"Fading out {len(audio_frames)} audio frames from the sink queue ")
-            # Combine all audio frames
-            combined_audio = b"".join(frame.audio for frame in audio_frames)
-            samples = np.frombuffer(combined_audio, dtype=np.int16)
 
-            num_samples = len(samples)
-            fade_curve = np.cos(np.linspace(0, np.pi / 2, num_samples, dtype=np.float32))
+            total_samples = sum(
+                len(frame.audio) // 2 for frame in audio_frames
+            )  # divide by 2 for int16
+            # using cosine fade to fade out the sound from 1.0 to 0.0
+            fade_curve = np.cos(np.linspace(0, np.pi / 2, total_samples, dtype=np.float32))
 
-            samples = (samples * fade_curve).astype(np.int16)
-            faded_audio = struct.pack(f"{len(samples)}h", *samples)
-            return faded_audio
+            sample_offset = 0
+            for frame in audio_frames:
+                samples = np.frombuffer(frame.audio, dtype=np.int16)
+                num_samples = len(samples)
+
+                # Get the segment of fade curve for this frame
+                frame_fade = fade_curve[sample_offset : sample_offset + num_samples]
+                # Apply fade to samples
+                samples = (samples * frame_fade).astype(np.int16)
+                chunk = OutputAudioRawFrame(
+                    struct.pack(f"{len(samples)}h", *samples),
+                    sample_rate=frame.sample_rate,
+                    num_channels=frame.num_channels,
+                )
+
+                await self._sink_queue.put(chunk)
+                sample_offset += num_samples
 
         except asyncio.QueueEmpty:
             print("Queue is empty, nothing to fade out")
             pass
 
     async def _cancel_sink_tasks(self):
-        # Stop sink tasks.
-        faded_audio = self._get_faded_out_queued_audio()
-
         if self._sink_task:
             await self.cancel_task(self._sink_task)
             self._sink_task = None
-            if faded_audio:
-                await self.write_raw_audio_frames(faded_audio)
         # Stop sink clock tasks.
         if self._sink_clock_task:
             await self.cancel_task(self._sink_clock_task)
