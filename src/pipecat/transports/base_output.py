@@ -312,6 +312,7 @@ class BaseOutputTransport(FrameProcessor):
             pass
 
     async def _cancel_sink_tasks(self):
+        # Stop sink tasks.
         if self._sink_task:
             await self.cancel_task(self._sink_task)
             self._sink_task = None
